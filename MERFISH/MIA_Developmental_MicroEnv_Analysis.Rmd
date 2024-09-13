@@ -1,0 +1,242 @@
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(future)
+library(purrr)
+library(nlme)
+plan("multisession", workers = 10)
+
+```
+
+```{r}
+
+saveDir <- '/Users/tim/Kalish_Lab/Projects_ongoing/MIA_Niche/Developmental_Niches/'
+obj <- readRDS("/Users/tim/Kalish_Lab/Projects_ongoing/MIA_Objects/e14_e18_broader_celltype.rds")
+cell.group = "broader_celltype" 
+neighbors.k = 30
+
+obj$niche_names <- gsub("fat$", "Fat", obj$niche_names, ignore.case = TRUE)
+
+num_niches = 6
+subDir <- paste0(saveDir, num_niches,'niches/')
+neighbor_df <- list()
+if (!dir.exists(subDir)) {dir.create(subDir, recursive = TRUE)}
+
+fovs <- names(obj@images)
+for(fov in fovs){
+  obj <- BuildNicheAssay(object = obj, fov = fov, group.by = cell.group, niches.k = num_niches, neighbors.k = 30)
+  DefaultAssay(obj) <- 'niche'
+  table <- as.data.frame(obj@assays$niche@counts)
+  table <- t(table)
+  neighbor_df[[fov]] <- table
+  print(fov)
+  # celltype.plot <- ImageDimPlot(obj, group.by = cell.group, fov = fov, size = 1, cols = "polychrome", dark.background = F) + ggtitle("Cell type")
+  # niche.plot <- ImageDimPlot(obj, group.by = "niches", fov = fov, size = 1, dark.background = F) + ggtitle("Niches")
+  # # Generate and save table
+  # niche_table <- table(obj$celltype, obj$niches)
+  # # Save plots
+  # ggsave(filename = paste0(subDir, fov, "_celltype_plot.png"), plot = celltype.plot, width = 10, height = 8)
+  # ggsave(filename = paste0(subDir, fov, "_niche_plot.png"), plot = niche.plot, width = 10, height = 8)
+  # write.csv(niche_table, file = paste0(subDir, fov, "_niche_table.csv"))
+}
+
+combined_df <- do.call(rbind, neighbor_df)
+combined_df <- as.data.frame(combined_df)
+celltype.vector <- colnames(combined_df)
+combined_df$cell_id <- rownames(combined_df)
+metadata_df <- obj@meta.data
+metadata_df$cell_id <- rownames(metadata_df)
+merged_df <- merge(combined_df, metadata_df, by = "cell_id")
+write.csv(merged_df, file = paste0(subDir, "combined_df.csv"))
+
+```
+
+
+```{r}
+data <- merged_df
+
+data$celltype <- data$broader_celltype
+
+# Get unique cell types
+data$celltype <- as.factor(gsub("_", "-", data$celltype))
+colnames(data) <- gsub("\\.", "-", colnames(data))
+data$Condition <- factor(data$Condition, levels = c("E14", "E18M"))
+unique_cell_types <- unique(data$celltype)
+
+
+# Define skip threshold percentage
+skip_threshold_percentage <- 70  # You can adjust this percentage as needed
+
+
+results_df <- tibble(
+  CentroidCellType = character(),
+  QueryCellType = character(),
+  TestType = character(),
+  PValue = numeric(),
+  MeanDifference = numeric(),
+  Condition1Median = numeric(),
+  Condition2Median = numeric()
+)
+
+for (centroid_cell_type in unique_cell_types) {
+  for (query_cell_type in unique_cell_types) {
+    if (!query_cell_type %in% names(data)) { next }
+
+    # Subset and prepare data
+    query_data <- data %>%
+      filter(celltype == centroid_cell_type) %>%
+      select(cell_id, Condition, Replicate, all_of(query_cell_type)) %>%
+      drop_na()
+
+    # Skip if not enough data
+    if (nrow(query_data) < 2 || length(unique(query_data$Condition)) < 2) { next }
+
+    # Calculate the percentage of zero counts for the query cell type
+    zero_count_percentage <- sum(query_data[[query_cell_type]] == 0) / nrow(query_data) * 100
+
+    # Filtration step: skip if more than the threshold percentage of counts are zero
+    if (zero_count_percentage > skip_threshold_percentage) { next }
+
+    # Additional filtration: ensure there are at least two non-zero observations for each condition
+    condition_counts <- query_data %>% group_by(Condition) %>% 
+      summarise(non_zero_count = sum(.data[[query_cell_type]] > 0))
+    
+    if (any(condition_counts$non_zero_count < 2)) { next }
+
+    # Additional check: ensure we have enough data to fit a mixed-effects model
+    if (length(unique(query_data$Replicate)) < 2) { next }  # We need at least 2 groups for random effects
+
+    # Prepare and fit the full linear mixed-effects model using ML instead of REML
+    full_formula <- as.formula(paste(query_cell_type, "~ Condition", sep = ""))
+    full_model <- tryCatch({
+      lme(full_formula, random = ~1 | Replicate, data = query_data, method = "ML")
+    }, error = function(e) return(NULL))
+    
+    # Fit the reduced model (without the Condition effect) using ML
+    reduced_formula <- as.formula(paste(query_cell_type, "~ 1", sep = ""))
+    reduced_model <- tryCatch({
+      lme(reduced_formula, random = ~1 | Replicate, data = query_data, method = "ML")
+    }, error = function(e) return(NULL))
+    
+    # Only continue if both models were successfully fitted
+    if (is.null(full_model) || is.null(reduced_model)) { next }
+    
+    # Perform the likelihood ratio test
+    lrt_result <- anova(full_model, reduced_model)
+    p_value <- lrt_result$`p-value`[2] # Get the p-value for the condition effect
+    
+    # Continue with your calculations and data frame population as before
+
+    # Calculate medians for each condition
+    condition1_median <- median(query_data %>% filter(Condition == levels(query_data$Condition)[1]) %>% pull(query_cell_type))
+    condition2_median <- median(query_data %>% filter(Condition == levels(query_data$Condition)[2]) %>% pull(query_cell_type))
+    median_diff <- condition1_median - condition2_median
+
+    # Extract fixed effects from the full model
+    fixed_effects <- fixef(full_model)
+
+    # Assuming the second fixed effect is the one of interest
+    condition_effect <- fixed_effects[2]
+
+    # Add results to the dataframe
+    results_df <- rbind(results_df, tibble(
+      CentroidCellType = centroid_cell_type,
+      QueryCellType = query_cell_type,
+      TestType = "Mixed-Effects Model",
+      PValue = p_value,
+      MeanDifference = condition_effect,  # or median_diff if more appropriate
+      Condition1Median = condition1_median,
+      Condition2Median = condition2_median
+    ))
+  }
+}
+
+
+  results_df$PValueAdjusted_BH <- p.adjust(results_df$PValue, method = "BH")
+  results_df <- results_df %>%
+    mutate(Significance = case_when(PValueAdjusted_BH < 0.05 ~ "*", TRUE ~ ""))
+  
+
+
+
+
+ggplot(results_df, aes(x = QueryCellType, y = CentroidCellType, fill = MeanDifference)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Significance), vjust = 1, color = "black", size = 6) +
+  scale_fill_gradient2(low = "#4393c3", high = "#d6604d", mid = "#f7f7f7", midpoint = 0, name = "Log2 Fold Change") +
+  theme_minimal() +
+  labs(title = "Cell Micro-environment Change From E14 to E18",
+       x = "Surrounding Cell Type", y = "Center Cell Type", fill = "Log2FC") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        text = element_text(face = "bold"),
+        legend.title.align = 0) 
+
+
+write_csv(results_df, "/Users/tim/Kalish_Lab/Projects_ongoing/MIA_Niche/E14vsE18_MicroEnv/results_df.csv")
+
+```
+
+```{r}
+
+  for (centroid_cell_type in unique_cell_types) {
+  for (query_cell_type in unique_cell_types) {
+    if (!query_cell_type %in% names(data)) { next }
+
+    # Subset and prepare data
+    query_data <- data %>%
+      filter(celltype == centroid_cell_type) %>%
+      select(Condition, all_of(query_cell_type)) %>%
+      drop_na()
+
+    # Skip if not enough data
+    if (nrow(query_data) < 2 || length(unique(query_data$Condition)) < 2) { next }
+
+    # Calculate the percentage of zero counts for the query cell type
+    zero_count_percentage <- sum(query_data[[query_cell_type]] == 0) / nrow(query_data) * 100
+
+    # Filtration step: skip if more than the threshold percentage of counts are zero
+    if (zero_count_percentage > skip_threshold_percentage) { next }
+
+    # Additional filtration: ensure there are at least two non-zero observations for each condition
+    condition_counts <- query_data %>% group_by(Condition) %>% 
+      summarise(non_zero_count = sum(.data[[query_cell_type]] > 0))
+    
+    if (any(condition_counts$non_zero_count < 2)) { next }
+    
+    # Perform t-test
+    formula_str <- paste("`", query_cell_type, "` ~ Condition", sep = "")
+    test_formula <- as.formula(formula_str)
+    test_result <- tryCatch(
+      {
+        t.test(test_formula, data = query_data)
+        
+      },
+      error = function(e) return(NULL)  # In case of an error, return NULL to skip this iteration
+    )
+
+    # Only continue if the t-test was successful
+    if (is.null(test_result)) { next }
+
+    c1_mean <- test_result$estimate[1]
+    c2_mean <- test_result$estimate[2]
+    mean_diff <- log2((c1_mean + 1) / (c2_mean + 1))
+
+    results_df <- rbind(results_df, tibble(
+      CentroidCellType = centroid_cell_type,
+      QueryCellType = query_cell_type,
+      TestType = "t-test",
+      PValue = test_result$p.value,
+      MeanDifference = mean_diff,
+      Condition1Mean = c1_mean,
+      Condition2Mean = c2_mean
+    ))
+  }
+}
+```
+

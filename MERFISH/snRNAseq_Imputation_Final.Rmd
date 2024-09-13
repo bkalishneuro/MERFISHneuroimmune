@@ -1,0 +1,559 @@
+
+# Load and preprocess scRNA and MERFISH datasets
+
+```{r}
+# Load necessary libraries
+library(FNN)
+library(Seurat)
+
+# Load scRNA-seq dataset
+input_seq <- "E14_seurat_Final.Robj"
+load(input_seq)
+metadata <- E14REDO_FullWithNames@meta.data
+counts <- E14REDO_FullWithNames@assays$RNA@counts
+seq <- CreateSeuratObject(counts = counts)
+seq <- AddMetaData(seq, metadata = metadata)
+
+# Load MERFISH dataset
+input_merfish <- "e14_completedata_layer1f.rds"
+output_dir <- "Imputation_E14_Final"
+merfish <- readRDS(input_merfish)
+merfish_features <- Features(merfish)
+seq_features <- Features(seq)
+
+# List of features to include
+ad_features <- c("Ank2", "Ash1l", "Brsk2", "Cgref1", "Dscam", "Nrxn1", "Pten", "Slc6a1", "Syngap1", "Chd8",
+                 "Ank3", "Scn2a", "Pik3ca", "Plxna1", "Tcf20", "Ski", "Auts2", "Bcl11a", "Cul3", "Dyrk1a",
+                 "Grin2b", "Kmt2e", "Mbd5", "Mef2c", "Nckap1", "Naa15", "Naa10", "Nckap1l", "Nckap1", "Nipbl",
+                 "Pax5", "Phf8", "Ppp2r5d", "Prr12", "Pten", "Ptpn11", "Ranbp2", "Setd2", "Shank3", "Smarcc2",
+                 "Syngap1", "Tbl1xr1", "Tlk2", "Trio", "Tsc2", "Ube3a", "Usp7", "Wac", "Wdr45", "Zfhx3",
+                 "Zfp292", "Zfp423", "Zbtb20", "Bcl11a", "Chd2", "Cul3", "Dnm1", "Eif4e", "Epc2", "Gabra1",
+                 "Kdm6b", "Mecp2", "Myt1l", "Naa15", "Neb", "Pax5", "Pbrm1", "Pten", "Pum2", "Ranbp2",
+                 "Setd5", "Shank1")
+
+# Subset features common to MERFISH and scRNA-seq datasets
+subset_features <- union(merfish_features, ad_features)
+subset_features <- intersect(subset_features, seq_features)
+seq <- subset(seq, features = subset_features)
+
+# Save the subsetted scRNA-seq object
+saveRDS(seq, "E14_seq.rds")
+
+# Clean up MERFISH object to reduce calculation burden
+merfish@assays$SCT <- list()
+merfish@assays$prediction.score.celltype <- list()
+merfish@assays$sketch <- list()
+merfish@images <- list()
+
+# Volume-adjusted expression data
+metadata <- readRDS(input_merfish)@meta.data
+cell_volumes <- merfish@meta.data$volume
+expression_data <- merfish@assays$Vizgen$counts
+expression_data_df <- as.data.frame(expression_data)
+expression_data_df <- t(expression_data_df)
+adjusted_volumes <- cell_volumes / 1000
+new_assay_data <- sweep(expression_data_df, 1, adjusted_volumes, `*`)
+new_assay_data <- t(new_assay_data)
+new_assay_data <- round(new_assay_data)
+merfish <- CreateSeuratObject(counts = new_assay_data)
+merfish <- AddMetaData(merfish, metadata = metadata)
+
+# Save the processed MERFISH object
+saveRDS(merfish, "E14_merfish.rds")
+
+```
+
+```{r}
+# Load necessary libraries
+library(FNN)
+library(Seurat)
+library(future)
+library(future.apply)
+
+# Set parallel processing
+plan(multisession, workers = 4)
+
+# Load processed datasets
+seq <- readRDS("E14_seq.rds")
+merfish <- readRDS("E14_merfish.rds")
+
+# Set cell type columns
+celltype_merfish <- "broad_celltype_est2"
+celltype_seq <- "predicted.celltype"
+
+# Set default assay
+DefaultAssay(merfish) <- "RNA"
+DefaultAssay(seq) <- "RNA"
+
+# Normalize and find variable features
+merfish <- NormalizeData(merfish)
+merfish <- FindVariableFeatures(merfish)
+merfish <- ScaleData(merfish)
+merfish <- RunPCA(merfish, verbose = FALSE, npcs = 30)
+merfish <- RunUMAP(merfish, reduction = "pca", dims = 1:30)
+
+# Visualize MERFISH annotations
+DimPlot(merfish, reduction = "umap", group.by = celltype_merfish)
+
+seq <- NormalizeData(seq)
+seq <- FindVariableFeatures(seq)
+seq <- ScaleData(seq)
+seq <- RunPCA(seq, npcs = 30)
+seq <- RunUMAP(seq, reduction = "pca", dims = 1:30)
+
+# Visualize scRNA-seq annotations
+DimPlot(seq, reduction = "umap")
+
+# Find transfer anchors
+anchors <- FindTransferAnchors(
+  reference = merfish,
+  query = seq,
+  reference.assay = "RNA",
+  query.assay = "RNA",
+  normalization.method = "LogNormalize",
+  reference.reduction = "pca",
+  dims = 1:30
+)
+
+# Increase maximum allowed size of globals
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GiB
+
+# Garbage collection to free up memory
+gc()
+
+# Set plan to sequential to avoid parallel overhead issues
+plan(sequential)
+
+# MapQuery to transfer annotations
+seq <- MapQuery(
+  anchorset = anchors,
+  query = seq,
+  reference = merfish,
+  refdata = list(
+    celltype = "broad_celltype_est2"  # Adjust this to your specific annotation column name in merfish
+  )
+)
+
+# Visualize transferred annotations
+DimPlot(seq, reduction = "umap", group.by = celltype_seq, label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+
+# Save the annotated object
+saveRDS(seq, file = "E14_seq_lt.rds")
+
+# Compare cell types between datasets
+merfish$celltype <- merfish@meta.data[[celltype_merfish]]
+merfish$dataset <- "merfish"
+seq$celltype <- seq@meta.data[[celltype_seq]]
+seq$dataset <- "seq"
+
+Idents(merfish) <- "celltype"
+Idents(seq) <- "celltype"
+
+celltypes_merfish <- unique(Idents(merfish))
+celltypes_seq <- unique(Idents(seq))
+
+# Find and print differences in cell types
+diff_merfish_seq <- setdiff(celltypes_merfish, celltypes_seq)
+print("Elements in celltypes_merfish not in celltypes_seq:")
+print(diff_merfish_seq)
+
+common_celltypes <- intersect(celltypes_merfish, celltypes_seq)
+
+```
+
+# Integrate and visualize datasets
+```{r}
+# Load necessary libraries
+library(FNN)
+library(Seurat)
+library(future)
+library(future.apply)
+
+# Set parallel processing
+plan(multisession, workers = 4)
+
+# Load processed datasets
+seq <- readRDS("E14_seq.rds")
+merfish <- readRDS("E14_merfish.rds")
+
+# Set cell type columns
+celltype_merfish <- "broad_celltype_est2"
+celltype_seq <- "predicted.celltype"
+
+# Set default assay
+DefaultAssay(merfish) <- "RNA"
+DefaultAssay(seq) <- "RNA"
+
+# Normalize and find variable features
+merfish <- NormalizeData(merfish)
+merfish <- FindVariableFeatures(merfish)
+merfish <- ScaleData(merfish)
+merfish <- RunPCA(merfish, verbose = FALSE, npcs = 30)
+merfish <- RunUMAP(merfish, reduction = "pca", dims = 1:30)
+
+# Visualize MERFISH annotations
+DimPlot(merfish, reduction = "umap", group.by = celltype_merfish)
+
+seq <- NormalizeData(seq)
+seq <- FindVariableFeatures(seq)
+seq <- ScaleData(seq)
+seq <- RunPCA(seq, npcs = 30)
+seq <- RunUMAP(seq, reduction = "pca", dims = 1:30)
+
+# Visualize scRNA-seq annotations
+DimPlot(seq, reduction = "umap")
+
+# Find transfer anchors
+anchors <- FindTransferAnchors(
+  reference = merfish,
+  query = seq,
+  reference.assay = "RNA",
+  query.assay = "RNA",
+  normalization.method = "LogNormalize",
+  reference.reduction = "pca",
+  dims = 1:30
+)
+
+# Increase maximum allowed size of globals
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GiB
+
+# Garbage collection to free up memory
+gc()
+
+# Set plan to sequential to avoid parallel overhead issues
+plan(sequential)
+
+# MapQuery to transfer annotations
+seq <- MapQuery(
+  anchorset = anchors,
+  query = seq,
+  reference = merfish,
+  refdata = list(
+    celltype = "broad_celltype_est2"  # Adjust this to your specific annotation column name in merfish
+  )
+)
+
+# Visualize transferred annotations
+DimPlot(seq, reduction = "umap", group.by = celltype_seq, label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+
+# Save the annotated object
+saveRDS(seq, file = "E14_seq_lt.rds")
+
+# Compare cell types between datasets
+merfish$celltype <- merfish@meta.data[[celltype_merfish]]
+merfish$dataset <- "merfish"
+seq$celltype <- seq@meta.data[[celltype_seq]]
+seq$dataset <- "seq"
+
+Idents(merfish) <- "celltype"
+Idents(seq) <- "celltype"
+
+celltypes_merfish <- unique(Idents(merfish))
+celltypes_seq <- unique(Idents(seq))
+
+# Find and print differences in cell types
+diff_merfish_seq <- setdiff(celltypes_merfish, celltypes_seq)
+print("Elements in celltypes_merfish not in celltypes_seq:")
+print(diff_merfish_seq)
+
+common_celltypes <- intersect(celltypes_merfish, celltypes_seq)
+
+```
+
+# Process partitions and impute gene expression
+```{r}
+# Load necessary libraries
+library(FNN)
+library(Seurat)
+
+# Directories for partitioned data
+partitioned_rds_dir <- "partitioned_RDS"
+partitioned_umap_dir <- "partitioned_UMAP"
+
+# Create directories if they don't exist
+dir.create(partitioned_rds_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(partitioned_umap_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Function to process each partition
+process_partition <- function(partition_merfish, partition_seq, celltype, partition_index) {
+  # Normalize and find variable features
+  partition_merfish <- SCTransform(partition_merfish, verbose = FALSE)
+  partition_seq <- SCTransform(partition_seq, verbose = FALSE)
+  
+  # Set default assay
+  DefaultAssay(partition_merfish) <- "SCT"
+  DefaultAssay(partition_seq) <- "SCT"
+  
+  object.list <- list("seq" = partition_seq, "merfish" = partition_merfish)
+  
+  anchors <- FindIntegrationAnchors(object.list = object.list, dims = 1:100)
+  sub_integrated <- IntegrateData(anchorset = anchors, dims = 1:100)
+  sub_integrated <- ScaleData(sub_integrated)
+  sub_integrated <- RunPCA(sub_integrated, npcs = 100)
+  sub_integrated <- RunUMAP(sub_integrated, reduction = "pca", dims = 1:100)
+  sub_integrated <- FindNeighbors(sub_integrated, dims = 1:100)
+  sub_integrated <- FindClusters(sub_integrated, resolution = 1)
+  
+  # Save UMAP plots to PDF
+  pdf(file = paste0(partitioned_umap_dir, "/umap_", celltype, "_part_", partition_index, ".pdf"))
+  print(DimPlot(sub_integrated, group.by = "seurat_clusters", split.by = "dataset"))
+  print(DimPlot(sub_integrated, group.by = "dataset"))
+  dev.off()
+  
+  # Save UMAP embeddings
+  umap_embeddings <- sub_integrated@reductions$umap@cell.embeddings
+  merfish_umap <- umap_embeddings[which(sub_integrated$dataset == "merfish"), ]
+  seq_umap <- umap_embeddings[which(sub_integrated$dataset == "seq"), ]
+  
+  # Identify genes present in scRNA-seq but not in MERFISH
+  seq_genes <- rownames(partition_seq@assays$SCT@data)
+  
+  # Initialize an empty data frame with rownames matching the MERFISH cell barcodes
+  imputed_gene_df <- data.frame(row.names = rownames(merfish_umap))
+  
+  # Imputation for all genes
+  for (gene in seq_genes) {
+    if (gene %in% rownames(partition_seq@assays$SCT@data)) {
+      seq_expression <- partition_seq@assays$SCT@data[gene, ]
+      nn <- get.knnx(seq_umap, merfish_umap, k = 30)
+      weights <- 1 / (nn$nn.dist + 1e-10)
+      weights <- weights / rowSums(weights)
+      imputed_expression <- rowSums(weights * as.matrix(seq_expression)[nn$nn.index, ])
+      
+      imputed_gene_df[[gene]] <- imputed_expression
+      cat("Imputation successful for gene:", gene, "\n")
+    } else {
+      cat("Gene", gene, "not found in seq data.\n")
+    }
+  }
+  
+  # Save imputed gene expressions for the partition
+  saveRDS(imputed_gene_df, file = paste0(partitioned_rds_dir, "/imputed_genes_", celltype, "_part_", partition_index, ".rds"))
+}
+
+# Process each common cell type
+for (celltype in common_celltypes) {
+  sub_merfish <- subset(merfish, idents = celltype)
+  sub_seq <- subset(seq, idents = celltype)
+  
+  n_cells <- ncol(sub_merfish)
+  partition_size <- 10000
+  
+  if (n_cells > partition_size) {
+    n_partitions <- ceiling(n_cells / partition_size)
+    cells_per_partition <- ceiling(n_cells / n_partitions)
+    cell_indices <- sample(n_cells)
+    
+    for (i in 1:n_partitions) {
+      start_idx <- (i - 1) * cells_per_partition + 1
+      end_idx <- min(i * cells_per_partition, n_cells)
+      partition_indices <- cell_indices[start_idx:end_idx]
+      
+      partition_merfish <- subset(sub_merfish, cells = partition_indices)
+      partition_seq <- sub_seq
+      
+      process_partition(partition_merfish, partition_seq, celltype, i)
+    }
+  } else {
+    process_partition(sub_merfish, sub_seq, celltype, 1)
+  }
+}
+
+```
+
+# Combine imputed data and preprocess Seurat object
+```{r}
+# Load necessary libraries
+library(dplyr)
+
+# Define directory containing RDS files
+rds_dir <- "/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/partitioned_RDS/"
+
+# List all RDS files in the directory
+rds_files <- list.files(rds_dir, pattern = "\\.rds$", full.names = TRUE)
+
+# Initialize an empty list to store dataframes
+df_list <- list()
+
+# Loop through each file and read the RDS file
+for (file in rds_files) {
+  df <- readRDS(file)
+  df_list[[file]] <- df
+}
+
+# Function to bind dataframes by matching column names
+bind_dfs <- function(df_list) {
+  # Get a list of all unique gene names (column names)
+  all_genes <- unique(unlist(lapply(df_list, colnames)))
+  
+  # Initialize an empty dataframe with all gene names as columns
+  combined_df <- data.frame(matrix(ncol = length(all_genes), nrow = 0))
+  colnames(combined_df) <- all_genes
+  
+  # Loop through each dataframe and bind rows
+  for (df in df_list) {
+    # Create an empty dataframe with all genes as columns
+    temp_df <- data.frame(matrix(ncol = length(all_genes), nrow = nrow(df)))
+    colnames(temp_df) <- all_genes
+    rownames(temp_df) <- rownames(df)
+    
+    # Fill in the gene expression values for existing genes
+    temp_df[, colnames(df)] <- df
+    
+    # Bind the rows to the combined dataframe
+    combined_df <- bind_rows(combined_df, temp_df)
+  }
+  
+  return(combined_df)
+}
+
+# Combine all dataframes
+combined_df <- bind_dfs(df_list)
+
+# Save the combined dataframe to an RDS file
+saveRDS(combined_df, file = "/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/combined_expression_data.rds")
+
+# Load the combined data
+combined_df <- readRDS("/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/combined_expression_data.rds")
+combined_df <- t(combined_df)
+rm(combined_df)
+
+# Create a Seurat object
+seurat <- CreateSeuratObject(counts = combined_df)
+
+# Load MERFISH metadata and add it to Seurat object
+merfish <- readRDS(input_merfish)
+metadata <- merfish@meta.data
+rm(merfish)
+cells <- WhichCells(seurat)
+
+metadata$cellid <- rownames(metadata)
+filtered_metadata <- metadata %>%
+  filter(cellid %in% cells)
+
+seurat <- AddMetaData(seurat, metadata = filtered_metadata)
+
+# Save the Seurat object
+saveRDS(seurat, "/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/E14_sobject.rds")
+
+```
+
+# Process and visualize the imputed Seurat object
+```{r}
+# Load necessary libraries
+library(Seurat)
+
+# Load Seurat object
+seurat <- readRDS("/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/E14_sobject.rds")
+
+# Set RNA assay as default and handle missing values
+DefaultAssay(seurat) <- "RNA"
+seurat@assays$RNA@layers$counts[is.na(seurat@assays$RNA@layers$counts)] <- 0
+
+# Filter out low-expressed genes
+min_cells <- 3  # Minimum number of cells a gene must be expressed in to be kept
+seurat <- subset(seurat, features = rownames(seurat)[Matrix::rowSums(seurat@assays$RNA@layers$counts > 0) >= min_cells])
+
+# Check for constant genes and remove them
+constant_genes <- rownames(seurat)[apply(seurat@assays$RNA@layers$counts, 1, function(x) var(x) == 0)]
+if (length(constant_genes) > 0) {
+  cat("Removing constant genes.\n")
+  seurat <- subset(seurat, features = rownames(seurat)[!rownames(seurat) %in% constant_genes])
+}
+
+# Normalize, find variable features, and scale data
+seurat <- NormalizeData(seurat, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat <- FindVariableFeatures(seurat, selection.method = "vst")
+seurat <- ScaleData(seurat)
+
+# Apply SCTransform
+seurat <- SCTransform(seurat)
+
+# Save processed Seurat object
+saveRDS(seurat, "/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/E14_sobject_subset.rds")
+
+# Set SCT as default assay
+DefaultAssay(seurat) <- "SCT"
+
+# Directory for plots
+output_dir <- "/Users/tim/Kalish_Lab/MERFISH_Analysis/Project/MIA_Imputation/Imputation_E14_Final/plots"
+dir.create(output_dir)
+
+# Feature plot for each field of view
+fov_names <- names(seurat@images)
+
+for (fov in fov_names) {
+  # Create directory for current FOV
+  fov_dir <- file.path(output_dir, fov)
+  dir.create(fov_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  DefaultFOV(seurat) <- fov
+  
+  for (feature in features) {
+    # Generate and save plot
+    cols <- c("lightgrey", "darkred")
+    p1 <- ImageFeaturePlot(seurat, features = feature, dark.background = FALSE, cols = cols, size = 0.5, blend.threshold = 1, alpha = 0.5)
+    file_path <- file.path(fov_dir, paste0(feature, ".pdf"))
+    pdf(file_path)
+    print(p1)
+    dev.off()
+  }
+}
+
+# Example plots
+cols <- c("darkblue", "darkred")
+ImageFeaturePlot(seurat, features = "Ank3", dark.background = FALSE, cols = cols, size = 0.5, blend.threshold = 0.5, alpha = 0.5, scale = "all")
+ImageFeaturePlot(seurat, features = "Ank3", dark.background = FALSE, cols = cols, size = 0.5, blend.threshold = 0.5, alpha = 0.5, scale = "feature")
+ImageFeaturePlot(seurat, features = "Ank3", dark.background = FALSE, cols = cols, size = 0.5, blend.threshold = 0.5, alpha = 0.5, scale = "none")
+
+```
+
+
+# Generate heatmap of average gene expression
+
+```{r}
+# Load necessary libraries
+library(ComplexHeatmap)
+library(Seurat)
+library(circlize)
+library(dplyr)
+library(tibble)
+
+# Extract and preprocess data
+expression_data <- GetAssayData(seurat, slot = "scale.data")
+metadata <- seurat@meta.data
+expression_data_subset <- expression_data[features, ]
+expression_data_df <- as.data.frame(t(expression_data_subset))
+expression_data_df$celltype <- metadata$broad_celltype_est2
+
+# Calculate average expression for each cell type
+average_expression <- expression_data_df %>%
+  group_by(celltype) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+# Convert to matrix and transpose
+average_expression_matrix <- as.matrix(average_expression[, -1])
+rownames(average_expression_matrix) <- average_expression$celltype
+average_expression_matrix <- t(average_expression_matrix)
+
+# Create heatmap annotation and color function
+celltypes <- colnames(average_expression_matrix)
+ha <- HeatmapAnnotation(celltype = celltypes)
+col_fun <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# Plot heatmap
+Heatmap(average_expression_matrix,
+        name = "Average Expression",
+        top_annotation = ha,
+        show_row_names = TRUE,
+        show_column_names = TRUE,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        col = col_fun,
+        row_title = "Genes",
+        row_title_gp = gpar(fontsize = 10),
+        column_title_gp = gpar(fontsize = 10),
+        show_heatmap_legend = TRUE)
+
+```
+
